@@ -816,13 +816,21 @@ class VpnClient
         $containerName = $serverData['container_name'];
         $protocolSlug = (string) ($serverData['install_protocol'] ?? '');
         $isAwg2 = (stripos($containerName, 'awg2') !== false || $protocolSlug === 'awg2');
-        $wgTool = $isAwg2 ? 'awg' : 'wg';
+        $preferredTool = $isAwg2 ? 'awg' : 'wg';
+        $fallbackTool = $isAwg2 ? 'wg' : 'awg';
+
+        $script = sprintf(
+            'set -e; umask 077; if command -v %s >/dev/null 2>&1; then keytool=%s; elif command -v %s >/dev/null 2>&1; then keytool=%s; else echo key_tool_not_found; exit 127; fi; priv=$("$keytool" genkey | tr -d "\r\n"); [ -n "$priv" ] || { echo empty_private_key; exit 1; }; pub=$(printf "%%s\n" "$priv" | "$keytool" pubkey | tr -d "\r\n"); [ -n "$pub" ] || { echo empty_public_key; exit 1; }; printf "%%s\n---\n%%s\n" "$priv" "$pub"',
+            escapeshellarg($preferredTool),
+            escapeshellarg($preferredTool),
+            escapeshellarg($fallbackTool),
+            escapeshellarg($fallbackTool)
+        );
 
         $cmd = sprintf(
-            "docker exec -i %s sh -lc 'set -e; umask 077; priv=\$(%s genkey | tr -d " . '"' . "\\r\\n" . '"' . "); [ -n \"\$priv\" ] || { echo empty_private_key; exit 1; }; pub=\$(printf " . '"' . "%%s\\n" . '"' . " \"\$priv\" | %s pubkey | tr -d " . '"' . "\\r\\n" . '"' . "); [ -n \"\$pub\" ] || { echo empty_public_key; exit 1; }; printf " . '"' . "%%s\\n---\\n%%s\\n" . '"' . " \"\$priv\" \"\$pub\"'",
+            "docker exec -i %s sh -lc %s",
             escapeshellarg($containerName),
-            $wgTool,
-            $wgTool
+            escapeshellarg($script)
         );
 
         $escaped = escapeshellarg($cmd);
@@ -876,10 +884,14 @@ class VpnClient
         // ALSO check IPs used in actual server config (catches clients created outside web panel)
         try {
             $containerName = $serverData['container_name'] ?? 'amnezia-awg';
+            $protocolSlug = (string) ($serverData['install_protocol'] ?? '');
+            $isAwg2 = (stripos($containerName, 'awg2') !== false || $protocolSlug === 'awg2');
+            $configFile = $isAwg2 ? 'awg0.conf' : 'wg0.conf';
             $server = new VpnServer($serverData['id']);
             $cmd = sprintf(
-                "docker exec %s cat /opt/amnezia/awg/wg0.conf 2>/dev/null",
-                escapeshellarg($containerName)
+                "docker exec %s sh -c %s",
+                escapeshellarg($containerName),
+                escapeshellarg("cat /opt/amnezia/awg/{$configFile} 2>/dev/null || cat /opt/amnezia/awg/wg0.conf 2>/dev/null || cat /opt/amnezia/awg/awg0.conf 2>/dev/null || true")
             );
             $serverConfig = $server->executeCommand($cmd, true);
 
@@ -1300,9 +1312,10 @@ class VpnClient
             throw new Exception('Refusing to add client with empty public key');
         }
 
-        // Determine correct tool names (awg for AWG2, wg for standard)
-        $wgTool = $isAwg2 ? 'awg' : 'wg';
-        $wgQuickTool = $isAwg2 ? 'awg-quick' : 'wg-quick';
+        $preferredWgTool = $isAwg2 ? 'awg' : 'wg';
+        $fallbackWgTool = $isAwg2 ? 'wg' : 'awg';
+        $preferredQuickTool = $isAwg2 ? 'awg-quick' : 'wg-quick';
+        $fallbackQuickTool = $isAwg2 ? 'wg-quick' : 'awg-quick';
 
         // 1. Create temp file for PSK (to avoid shell escaping issues)
         $pskFile = '/tmp/' . bin2hex(random_bytes(8)) . '.psk';
@@ -1311,13 +1324,19 @@ class VpnClient
 
         // 2. Add peer using wg/awg set
         $cmd2 = sprintf(
-            "docker exec -i %s %s set %s peer %s preshared-key %s allowed-ips %s/32",
-            $containerName,
-            $wgTool,
-            $ifaceName,
-            escapeshellarg($publicKey),
-            $pskFile,
-            $clientIP
+            "docker exec -i %s sh -lc %s",
+            escapeshellarg($containerName),
+            escapeshellarg(sprintf(
+                'set -e; if command -v %s >/dev/null 2>&1; then keytool=%s; elif command -v %s >/dev/null 2>&1; then keytool=%s; else echo key_tool_not_found; exit 127; fi; "$keytool" set %s peer %s preshared-key %s allowed-ips %s/32',
+                escapeshellarg($preferredWgTool),
+                escapeshellarg($preferredWgTool),
+                escapeshellarg($fallbackWgTool),
+                escapeshellarg($fallbackWgTool),
+                escapeshellarg($ifaceName),
+                escapeshellarg($publicKey),
+                escapeshellarg($pskFile),
+                escapeshellarg($clientIP)
+            ))
         );
         self::executeServerCommand($serverData, $cmd2, true);
 
@@ -1338,9 +1357,20 @@ class VpnClient
         // 5. Update clientsTable
         self::updateClientsTable($serverData, $publicKey, $clientIP);
 
-        // 6. CRITICAL: Reload WG interface to apply AWG obfuscation params
-        // Without this, the interface uses standard WireGuard without Jc/S1/S2/H1-H4
-        $cmd5 = sprintf("docker exec -i %s sh -c 'ip link del %s 2>/dev/null || true; %s up %s/%s 2>&1'", $containerName, $ifaceName, $wgQuickTool, $configDir, $configFile);
+        // 6. Reload WG interface to apply AWG obfuscation params.
+        $cmd5 = sprintf(
+            "docker exec -i %s sh -lc %s",
+            escapeshellarg($containerName),
+            escapeshellarg(sprintf(
+                'if command -v %s >/dev/null 2>&1; then quicktool=%s; elif command -v %s >/dev/null 2>&1; then quicktool=%s; else echo quick_tool_not_found; exit 127; fi; ip link del %s 2>/dev/null || true; "$quicktool" up %s 2>&1',
+                escapeshellarg($preferredQuickTool),
+                escapeshellarg($preferredQuickTool),
+                escapeshellarg($fallbackQuickTool),
+                escapeshellarg($fallbackQuickTool),
+                escapeshellarg($ifaceName),
+                escapeshellarg($configDir . '/' . $configFile)
+            ))
+        );
         self::executeServerCommand($serverData, $cmd5, true);
     }
 
@@ -2730,5 +2760,3 @@ class VpnClient
         return $disabled;
     }
 }
-
-
